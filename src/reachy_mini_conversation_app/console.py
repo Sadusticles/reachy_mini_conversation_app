@@ -7,10 +7,12 @@ served via the Reachy Mini Apps settings server so users can configure it.
 import time
 import asyncio
 import logging
+import itertools
 import threading
 from typing import Any, List, Optional
 from pathlib import Path
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Mapping, Callable
 
 import numpy as np
 
@@ -104,6 +106,7 @@ LEGACY_STARTUP_ENV_NAMES = (
     "REACHY_MINI_VOICE_OVERRIDE",
 )
 BACKEND_RETRY_DELAY_SECONDS = 5.0
+CONVERSATION_HISTORY_LIMIT = 200  # events, about 100 exchanges
 PLAYBACK_LEAD_SECONDS = 0.1  # paced chunks reach the SDK this far ahead of their slot
 
 
@@ -149,10 +152,15 @@ class LocalStream:
         self._backend_error: str | None = None
         self._backend_retry_delay = BACKEND_RETRY_DELAY_SECONDS
         # JSON-RPC control surface (mounted at /rpc in _init_settings_ui_if_needed).
-        # Notifications (conversation.turn/phase/transcript/activity) are pushed
-        # here from activity + transcripts. Survives handler rebuilds (mounted once).
+        # Notifications (conversation.turn/phase/transcript/latency/activity) are pushed
+        # here from activity, transcripts and latencies. Survives handler rebuilds (mounted once).
         self._rpc: Optional[JsonRpcServer] = None
         self._last_turn_state: Optional[str] = None
+        # This run's final transcripts and latencies, replayed by conversation.history so a page
+        # opened mid-conversation shows earlier turns. In memory only: gone when the app stops.
+        self._conversation_history: deque[dict[str, object]] = deque(maxlen=CONVERSATION_HISTORY_LIMIT)
+        # Seeded from the wall clock so a restarted app's events sort after those an open page has seen.
+        self._conversation_seq = itertools.count(int(time.time() * 1000))
         # Per-role throttle timestamps for conversation.level (orb audio meter).
         self._last_level_emit: dict[str, float] = {}
         self._install_handler(handler)
@@ -164,13 +172,16 @@ class LocalStream:
         self._attach_observers_to_handler()
 
     def _attach_observers_to_handler(self) -> None:
-        """Wire the handler's activity + transcript observers to JSON-RPC pushes."""
+        """Wire the handler's activity, transcript and latency observers to JSON-RPC pushes."""
         setter = getattr(self.handler, "set_activity_observer", None)
         if callable(setter):
             setter(self._dispatch_activity)
         transcript_setter = getattr(self.handler, "set_transcript_observer", None)
         if callable(transcript_setter):
             transcript_setter(self._dispatch_transcript)
+        latency_setter = getattr(self.handler, "set_latency_observer", None)
+        if callable(latency_setter):
+            latency_setter(self._dispatch_latency)
 
         self.handler.set_vad_observer(self._dispatch_vad)
 
@@ -179,12 +190,23 @@ class LocalStream:
             self._rpc.broadcast_threadsafe("conversation.vad", dict(status))
 
     def _dispatch_transcript(self, role: str, text: str, final: bool) -> None:
-        """Push a conversation.transcript notification to JSON-RPC clients."""
+        """Push a conversation.transcript notification, recording final ones in the history."""
+        params: dict[str, object] = {"role": role, "text": text, "final": final}
+        if final:
+            self._publish_conversation_event("conversation.transcript", params)
+        elif self._rpc is not None:
+            self._rpc.broadcast_threadsafe("conversation.transcript", params)
+
+    def _dispatch_latency(self, latency: dict[str, int | str | None]) -> None:
+        """Push a conversation.latency notification and record it in the history."""
+        self._publish_conversation_event("conversation.latency", latency)
+
+    def _publish_conversation_event(self, method: str, params: Mapping[str, object]) -> None:
+        """Record one event in this run's history, then push it with its sequence number."""
+        event_params = {**params, "seq": next(self._conversation_seq)}
+        self._conversation_history.append({"method": method, "params": event_params})
         if self._rpc is not None:
-            self._rpc.broadcast_threadsafe(
-                "conversation.transcript",
-                {"role": role, "text": text, "final": final},
-            )
+            self._rpc.broadcast_threadsafe(method, event_params)
 
     # Audio level meter for the client orb. RMS is scaled into a visible 0..1
     # range and capped to ~15 Hz so it stays light on the DataChannel.
@@ -555,7 +577,7 @@ class LocalStream:
         # ── JSON-RPC control surface (/rpc) ──────────────────────────────
         # The single wire format both the local browser UI and remote WebRTC
         # clients use (the daemon relays it over the DataChannel). Notifications
-        # (conversation.turn/phase/transcript/activity) are pushed from activity.
+        # (conversation.turn/phase/transcript/latency/activity) are pushed from activity.
         rpc = JsonRpcServer()
 
         # SDK isn't marked py.typed, so mypy sees rpc.method as untyped; safe here.
@@ -582,6 +604,10 @@ class LocalStream:
             self._last_turn_state = "listening"
             rpc.broadcast_threadsafe("conversation.turn", {"state": "listening", "reason": "interrupted"})
             return {"ok": True}
+
+        @rpc.method("conversation.history")  # type: ignore[untyped-decorator]
+        def _rpc_history(_params: dict[str, object]) -> dict[str, object]:
+            return {"events": list(self._conversation_history)}
 
         @rpc.method("conversation.mic")  # type: ignore[untyped-decorator]
         def _rpc_mic(params: dict[str, object]) -> dict[str, object]:

@@ -198,7 +198,7 @@ class _FakeEvent:
         """Store the event type and any extra attributes."""
         self.type = event_type
         if event_type in ("response.created", "response.done"):
-            fields.setdefault("response", SimpleNamespace(id="response-1"))
+            fields.setdefault("response", SimpleNamespace(id="response-1", metadata=None))
         if event_type.startswith("response.output_audio"):
             fields.setdefault("response_id", "response-1")
         self.__dict__.update(fields)
@@ -778,6 +778,77 @@ async def test_run_session_emits_completed_transcript(monkeypatch: Any) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_session_observes_user_partial_transcript(monkeypatch: Any) -> None:
+    """The debounced user partial reaches the transcript observer as a non-final transcript."""
+    handler = _session_handler(
+        monkeypatch,
+        (
+            _FakeEvent("conversation.item.input_audio_transcription.delta", item_id="item-1", delta="Hey how"),
+            _FakeEvent("conversation.item.input_audio_transcription.delta", item_id="item-1", delta=" are you"),
+        ),
+    )
+    handler.partial_debounce_delay = 0
+    transcripts: list[tuple[str, str, bool]] = []
+    handler.set_transcript_observer(lambda role, text, final: transcripts.append((role, text, final)))
+
+    await handler._run_realtime_session()
+    assert handler.partial_transcript_task is not None
+    await handler.partial_transcript_task
+
+    assert transcripts == [("user", "Hey how are you", False)]
+
+
+@pytest.mark.asyncio
+async def test_run_session_observes_server_turn_latency(monkeypatch: Any) -> None:
+    """response.done turn-latency metadata reaches the latency observer in ms; absent or malformed metadata is skipped."""
+    turn_latency = json.dumps(
+        {
+            "version": 2,
+            "vad_decision_s": 0.0302,
+            "smart_status": "complete",
+            "stt_s": 0.2104,
+            "llm_s": 0.48,
+            "tts_ttfa_s": 0.1,
+            "e2e_s": None,
+            "hold_s": None,
+            "status": "cancelled",
+        }
+    )
+
+    def response_done(metadata: dict[str, str] | None) -> _FakeEvent:
+        return _FakeEvent("response.done", response=SimpleNamespace(id="response-1", metadata=metadata))
+
+    handler = _session_handler(
+        monkeypatch,
+        (
+            response_done({"speech_to_speech.turn_latency": turn_latency}),
+            response_done(None),
+            response_done({"speech_to_speech.turn_latency": "not json"}),
+            response_done({"speech_to_speech.turn_latency": '{"stt_s": NaN, "status": "completed"}'}),
+        ),
+    )
+    latencies: list[dict[str, int | str | None]] = []
+    handler.set_latency_observer(latencies.append)
+
+    await handler._run_realtime_session()
+
+    missing_stages = dict.fromkeys(["vad_decision_ms", "stt_ms", "llm_ms", "tts_ttfa_ms", "e2e_ms", "hold_ms"])
+    assert latencies == [
+        {
+            "vad_decision_ms": 30,
+            "stt_ms": 210,
+            "llm_ms": 480,
+            "tts_ttfa_ms": 100,
+            "e2e_ms": None,
+            "hold_ms": None,
+            "smart_status": "complete",
+            "status": "cancelled",
+        },
+        {**missing_stages, "smart_status": None, "status": "completed"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_run_session_skips_empty_completed_transcript(monkeypatch: Any) -> None:
     """An empty completed transcript is ignored but still stops listening."""
     handler = _session_handler(
@@ -1096,7 +1167,10 @@ async def test_run_session_response_lifecycle_toggles_done_event(monkeypatch: An
     """response.created clears the done gate and response.done sets it again."""
     handler = _session_handler(
         monkeypatch,
-        (_FakeEvent("response.created"), _FakeEvent("response.done")),
+        (
+            _FakeEvent("response.created"),
+            _FakeEvent("response.done", response=SimpleNamespace(id="response-1", metadata=None)),
+        ),
     )
 
     await handler._run_realtime_session()

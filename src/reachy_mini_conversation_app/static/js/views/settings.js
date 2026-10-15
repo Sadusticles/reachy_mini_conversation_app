@@ -10,6 +10,7 @@ import {
   saveSpeechConfig,
   untilReady,
 } from "../api.js";
+import { SHOW_LATENCIES_KEY } from "../constants.js";
 import { h } from "../ui.js";
 
 const HF_CONNECTION_MODES = Object.freeze({
@@ -36,6 +37,7 @@ export async function mountSettingsView({ outlet, signal }) {
   const voiceSection = buildVoiceSection();
   const statusSection = buildStatusSection();
   const speechSection = buildSpeechSection();
+  const developerSection = buildDeveloperSection();
 
   const view = h(
     "section",
@@ -49,7 +51,8 @@ export async function mountSettingsView({ outlet, signal }) {
     connectionSection.element,
     voiceSection.element,
     speechSection.element,
-    statusSection.element
+    statusSection.element,
+    developerSection
   );
   outlet.replaceChildren(view);
 
@@ -314,6 +317,35 @@ function buildSpeechSection() {
       submitButton.disabled = false;
     },
   };
+}
+
+function buildDeveloperSection() {
+  const showLatencies = h("input", {
+    type: "checkbox",
+    name: "show_latencies",
+    checked: localStorage.getItem(SHOW_LATENCIES_KEY) === "1",
+    onChange: (event) => localStorage.setItem(SHOW_LATENCIES_KEY, event.target.checked ? "1" : "0"),
+  });
+  return h(
+    "details",
+    { class: "settings-section settings-developer" },
+    h("summary", { class: "settings-section-title" }, "Developer options"),
+    h(
+      "div",
+      { class: "settings-form" },
+      h(
+        "label",
+        { class: "settings-toggle" },
+        showLatencies,
+        h(
+          "span",
+          {},
+          h("strong", {}, "Show response latencies"),
+          h("span", { class: "settings-hint" }, "Adds the backend's timing breakdown under each reply in the conversation panel.")
+        )
+      )
+    )
+  );
 }
 
 function buildStatusSection() {
